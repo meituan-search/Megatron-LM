@@ -692,6 +692,53 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
+def fused_dsa_fn(query, key, value, topk_indices, softmax_scale, block_q=128):
+    # query: [sq,b,np,hn], key: [skv,b,np,hn], value: [skv,b,np,hnv]
+    sq,b,np,hn = query.shape
+    skv = key.shape[0]
+    hnv = value.shape[3]
+    device = query.device
+    dtype = query.dtype
+
+    # layout: [b,np,*,*]
+    q = query.permute(1,2,0,3)          # [b,np,sq,hn]
+    k_mem = key.permute(1,2,0,3)        # [b,np,skv,hn]
+    v_mem = value.permute(1,2,0,3)      # [b,np,skv,hnv]
+
+    # indices: [b,sq,k]
+    idx_all = topk_indices.to(torch.long).clamp_(0, skv-1)
+
+    out = torch.empty((b,np,sq,hnv), device=device, dtype=dtype)
+
+    for qs in range(0, sq, block_q):
+        qe = min(qs + block_q, sq)
+        bq = qe - qs
+
+        qb = q[:, :, qs:qe, :]              # [b,np,bq,hn]
+        idx = idx_all[:, qs:qe, :]          # [b,bq,k]
+
+        qpos = torch.arange(qs, qe, device=device)[None, :, None]   # [1,bq,1]
+        causal_bad = idx > qpos                                     # [b,bq,k]
+
+        # k_mem5: [b,np,1,skv,hn]
+        k_mem5 = k_mem.unsqueeze(2)
+        v_mem5 = v_mem.unsqueeze(2)
+
+        idx5_k = idx[:, None, :, :, None].expand(b, np, bq, idx.shape[-1], hn)
+        idx5_v = idx[:, None, :, :, None].expand(b, np, bq, idx.shape[-1], hnv)
+
+        k_sel = torch.gather(k_mem5, dim=3, index=idx5_k)   # [b,np,bq,k,hn]
+        v_sel = torch.gather(v_mem5, dim=3, index=idx5_v)   # [b,np,bq,k,hnv]
+
+        logits = (qb[:, :, :, None, :] * k_sel).sum(-1).float() * softmax_scale  # [b,np,bq,k]
+        logits = logits.masked_fill(causal_bad[:, None, :, :], float("-inf"))
+        p = torch.softmax(logits, dim=-1).to(dtype)  # [b,np,bq,k]
+
+        out[:, :, qs:qe, :] = (p[..., None] * v_sel).sum(dim=-2)  # sum over k
+
+    out = out.permute(2,0,1,3).contiguous()  # [sq,b,np,hnv]
+    return out
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
