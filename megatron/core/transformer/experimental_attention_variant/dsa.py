@@ -692,51 +692,125 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
-def fused_dsa_fn(query, key, value, topk_indices, softmax_scale, block_q=128):
-    # query: [sq,b,np,hn], key: [skv,b,np,hn], value: [skv,b,np,hnv]
-    sq,b,np,hn = query.shape
+def blocked_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,   # [b, sq, k], shared across heads
+    softmax_scale: float,
+    block_q: int = 128,
+    head_block: int = 8,
+    sort_indices: bool = True,
+    ensure_one_causal: bool = True,
+    assume_causal_indices: bool = False,
+):
+    """
+    Blocked Sparse Attention (PyTorch baseline) for topk_indices shape [b, sq, k].
+
+    A) FP32 logits + FP32 softmax; no singleton dims
+    B) Expand indices only per q-block
+    C) Head blocking to reduce peak memory
+    D) Optional indices sorting for better gather locality
+
+    Preconditions you confirmed:
+      - topk_indices are in 0..skv-1
+      - index coordinate system aligns with qpos (query position)
+
+    If assume_causal_indices=True:
+      - assumes indexer already ensures idx <= qpos for each query token
+      - skips causal masking (fastest)
+    """
+    assert query.dim() == 4 and key.dim() == 4 and value.dim() == 4
+    assert topk_indices.dim() == 3, "Expected topk_indices shape [b, sq, k]."
+
+    sq, b, np, hn = query.shape
     skv = key.shape[0]
     hnv = value.shape[3]
+    k_top = topk_indices.shape[-1]
+
     device = query.device
     dtype = query.dtype
 
-    # layout: [b,np,*,*]
-    q = query.permute(1,2,0,3)          # [b,np,sq,hn]
-    k_mem = key.permute(1,2,0,3)        # [b,np,skv,hn]
-    v_mem = value.permute(1,2,0,3)      # [b,np,skv,hnv]
+    # [sq,b,np,*] -> [b,np,sq,*]
+    q = query.permute(1, 2, 0, 3)
+    # [skv,b,np,*] -> [b,np,skv,*]
+    k_mem = key.permute(1, 2, 0, 3)
+    v_mem = value.permute(1, 2, 0, 3)
 
-    # indices: [b,sq,k]
-    idx_all = topk_indices.to(torch.long).clamp_(0, skv-1)
+    out = torch.empty((b, np, sq, hnv), device=device, dtype=dtype)
 
-    out = torch.empty((b,np,sq,hnv), device=device, dtype=dtype)
+    # absolute query positions
+    q_positions = torch.arange(sq, device=device, dtype=torch.long)
 
-    for qs in range(0, sq, block_q):
-        qe = min(qs + block_q, sq)
-        bq = qe - qs
+    # sanitize indices once
+    idx_all = topk_indices.to(torch.long).clamp_(0, skv - 1)  # [b, sq, k]
 
-        qb = q[:, :, qs:qe, :]              # [b,np,bq,hn]
-        idx = idx_all[:, qs:qe, :]          # [b,bq,k]
+    for hb in range(0, np, head_block):
+        he = min(hb + head_block, np)
+        hsz = he - hb
 
-        qpos = torch.arange(qs, qe, device=device)[None, :, None]   # [1,bq,1]
-        causal_bad = idx > qpos                                     # [b,bq,k]
+        q_h = q[:, hb:he, :, :]         # [b, hsz, sq, hn]
+        k_h = k_mem[:, hb:he, :, :]     # [b, hsz, skv, hn]
+        v_h = v_mem[:, hb:he, :, :]     # [b, hsz, skv, hnv]
 
-        # k_mem5: [b,np,1,skv,hn]
-        k_mem5 = k_mem.unsqueeze(2)
-        v_mem5 = v_mem.unsqueeze(2)
+        for qs in range(0, sq, block_q):
+            qe = min(qs + block_q, sq)
+            bq = qe - qs
 
-        idx5_k = idx[:, None, :, :, None].expand(b, np, bq, idx.shape[-1], hn)
-        idx5_v = idx[:, None, :, :, None].expand(b, np, bq, idx.shape[-1], hnv)
+            qb = q_h[:, :, qs:qe, :]  # [b, hsz, bq, hn]
 
-        k_sel = torch.gather(k_mem5, dim=3, index=idx5_k)   # [b,np,bq,k,hn]
-        v_sel = torch.gather(v_mem5, dim=3, index=idx5_v)   # [b,np,bq,k,hnv]
+            # ---- B) indices only for this q-block; expand to head-block ----
+            idx_blk = idx_all[:, qs:qe, :]  # [b, bq, k]
+            idx = idx_blk.unsqueeze(1).expand(b, hsz, bq, k_top)  # [b,hsz,bq,k]
 
-        logits = (qb[:, :, :, None, :] * k_sel).sum(-1).float() * softmax_scale  # [b,np,bq,k]
-        logits = logits.masked_fill(causal_bad[:, None, :, :], float("-inf"))
-        p = torch.softmax(logits, dim=-1).to(dtype)  # [b,np,bq,k]
+            # ---- D) optional sort for locality ----
+            if sort_indices:
+                idx = idx.sort(dim=-1).values
 
-        out[:, :, qs:qe, :] = (p[..., None] * v_sel).sum(dim=-2)  # sum over k
+            causal_bad = None
+            if not assume_causal_indices:
+                # ---- causal mask (correct since idx and qpos share the same coordinate system) ----
+                qpos = q_positions[qs:qe].view(1, 1, bq, 1)  # [1,1,bq,1]
+                causal_bad = idx > qpos                      # [b,hsz,bq,k]
 
-    out = out.permute(2,0,1,3).contiguous()  # [sq,b,np,hnv]
+                # Optional safety to avoid all -inf -> NaN
+                if ensure_one_causal:
+                    # prevent runtime error
+                    if not sort_indices:
+                        idx = idx.clone()
+                    
+                    qpos3 = qpos.squeeze(-1).expand(b, hsz, bq)  # [b,hsz,bq]
+                    idx0 = idx[..., 0]
+                    idx[..., 0] = torch.minimum(idx0, qpos3)
+                    causal_bad = idx > qpos
+
+            # ---- Gather K/V with 5D gather ----
+            # expand memory along bq to satisfy gather shape rules
+            k_in = k_h.unsqueeze(2).expand(b, hsz, bq, skv, hn)
+            v_in = v_h.unsqueeze(2).expand(b, hsz, bq, skv, hnv)
+
+            idx_k = idx.unsqueeze(-1).expand(b, hsz, bq, k_top, hn)
+            idx_v = idx.unsqueeze(-1).expand(b, hsz, bq, k_top, hnv)
+
+            k_sel = torch.gather(k_in, dim=3, index=idx_k)  # [b,hsz,bq,k,hn]
+            v_sel = torch.gather(v_in, dim=3, index=idx_v)  # [b,hsz,bq,k,hnv]
+
+            # ---- A) FP32 logits + FP32 softmax ----
+            scores = torch.einsum("bhqd,bhqkd->bhqk", qb, k_sel).float()
+            scores.mul_(softmax_scale)
+
+            if causal_bad is not None:
+                scores.masked_fill_(causal_bad, float("-inf"))
+
+            probs = torch.softmax(scores, dim=-1)   # fp32 [b,hsz,bq,k]
+            probs = probs.to(dtype)
+
+            out_chunk = torch.einsum("bhqk,bhqkd->bhqd", probs, v_sel)  # [b,hsz,bq,hnv]
+            out[:, hb:he, qs:qe, :] = out_chunk
+
+    # [b,np,sq,hnv] -> [sq,b,np,hnv] -> [sq,b,np*hnv]
+    out = out.permute(2, 0, 1, 3).contiguous()
+    out = out.reshape(sq, b, np * hnv)
     return out
 
 class DSAttention(MegatronModule):
